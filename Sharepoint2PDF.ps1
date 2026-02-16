@@ -6,6 +6,8 @@
     [int]$MinContentChars = 50,
     [int]$HeadlessWaitSec = 120,
     [int]$HeadlessWaitMs = 0,
+    [int]$HeadlessViewportWidth = 1200,
+    [double]$HeadlessSecondPassWidthFactor = 0.85,
     [switch]$HeadlessSecondPass
 )
 
@@ -30,6 +32,15 @@ if ($HeadlessWaitMs -gt 0) {
 if ($HeadlessWaitSec -lt 1) { $HeadlessWaitSec = 1 }
 $effectiveHeadlessWaitMs = $HeadlessWaitSec * 1000
 if (-not $PSBoundParameters.ContainsKey('HeadlessSecondPass')) { $HeadlessSecondPass = $true }
+if ($HeadlessViewportWidth -lt 800) { $HeadlessViewportWidth = 800 }
+if ($HeadlessSecondPassWidthFactor -le 0 -or $HeadlessSecondPassWidthFactor -gt 1) { $HeadlessSecondPassWidthFactor = 0.85 }
+$a4Ratio = [Math]::Sqrt(2)
+$viewportHeight = [int][Math]::Round($HeadlessViewportWidth * $a4Ratio)
+$headlessWindowSize = "{0},{1}" -f $HeadlessViewportWidth, $viewportHeight
+$secondPassViewportWidth = [int][Math]::Round($HeadlessViewportWidth * $HeadlessSecondPassWidthFactor)
+if ($secondPassViewportWidth -lt 800) { $secondPassViewportWidth = 800 }
+$secondPassViewportHeight = [int][Math]::Round($secondPassViewportWidth * $a4Ratio)
+$secondPassWindowSize = "{0},{1}" -f $secondPassViewportWidth, $secondPassViewportHeight
 
 function Get-PdfPageCount {
     param([string]$Path)
@@ -88,8 +99,9 @@ if ($Headless) {
     }
 
     Write-Host "Headless wait budget: $HeadlessWaitSec sec ($effectiveHeadlessWaitMs ms)"
+    Write-Host "Headless viewport (A4 portrait ratio): $headlessWindowSize"
     $printSw = [System.Diagnostics.Stopwatch]::StartNew()
-    $exitCode = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $outPath -TargetUrl $url -WaitMs $effectiveHeadlessWaitMs -WindowSize "1920,1080"
+    $exitCode = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $outPath -TargetUrl $url -WaitMs $effectiveHeadlessWaitMs -WindowSize $headlessWindowSize
     $printSw.Stop()
     Write-Host "Edge headless print process exited with code $exitCode after $([Math]::Round($printSw.Elapsed.TotalSeconds,1))s"
 
@@ -106,9 +118,9 @@ if ($Headless) {
         $retryWaitMs = [Math]::Max($effectiveHeadlessWaitMs * 2, 240000)
         $retryWaitSec = [int][Math]::Ceiling($retryWaitMs / 1000.0)
         $secondPassPath = [IO.Path]::ChangeExtension($outPath, $null) + ".pass2.pdf"
-        Write-Host "Running second pass for image completeness (${retryWaitSec}s / ${retryWaitMs}ms), taller viewport..."
+        Write-Host "Running second pass for image completeness (${retryWaitSec}s / ${retryWaitMs}ms), narrower A4 portrait viewport $secondPassWindowSize..."
         $retrySw = [System.Diagnostics.Stopwatch]::StartNew()
-        $exitCode2 = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $secondPassPath -TargetUrl $url -WaitMs $retryWaitMs -WindowSize "1920,4000"
+        $exitCode2 = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $secondPassPath -TargetUrl $url -WaitMs $retryWaitMs -WindowSize $secondPassWindowSize
         $retrySw.Stop()
         Write-Host "Retry print process exited with code $exitCode2 after $([Math]::Round($retrySw.Elapsed.TotalSeconds,1))s"
 
