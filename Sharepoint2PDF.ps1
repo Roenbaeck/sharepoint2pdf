@@ -1,5 +1,7 @@
 ﻿param(
-    [string]$Url = "https://amfpension.sharepoint.com/sites/DWplattformsteam-STM/SitePages/Kundvärdesmodellen.aspx",
+    [Parameter(Mandatory=$true)]
+    [ValidateNotNullOrEmpty()]
+    [string]$Url,
     [string]$Output = "C:\KVM-PDF",
     [string]$UserDataDir = "",
     [int]$WaitSec = 120,
