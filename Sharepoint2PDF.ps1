@@ -4,7 +4,9 @@
     [string]$UserDataDir = "",
     [int]$MaxDepth = 1,
     [int]$MinContentChars = 50,
-    [int]$HeadlessWaitMs = 120000
+    [int]$HeadlessWaitSec = 120,
+    [int]$HeadlessWaitMs = 0,
+    [switch]$HeadlessSecondPass
 )
 
 $url = "https://amfpension.sharepoint.com/sites/DWplattformsteam-STM/SitePages/Kundvärdesmodellen.aspx"
@@ -20,6 +22,14 @@ $profileDir = if ($UserDataDir -and (Test-Path $UserDataDir)) { $UserDataDir } e
 if (-not (Test-Path $profileDir)) { New-Item -Path $profileDir -ItemType Directory | Out-Null }
 $outPath = $HeadlessOutput
 if (-not (Test-Path (Split-Path $outPath -Parent))) { New-Item -Path (Split-Path $outPath -Parent) -ItemType Directory | Out-Null }
+
+if ($HeadlessWaitMs -gt 0) {
+    Write-Host "HeadlessWaitMs is deprecated; converting ${HeadlessWaitMs}ms to seconds. Use -HeadlessWaitSec instead."
+    $HeadlessWaitSec = [int][Math]::Ceiling($HeadlessWaitMs / 1000.0)
+}
+if ($HeadlessWaitSec -lt 1) { $HeadlessWaitSec = 1 }
+$effectiveHeadlessWaitMs = $HeadlessWaitSec * 1000
+if (-not $PSBoundParameters.ContainsKey('HeadlessSecondPass')) { $HeadlessSecondPass = $true }
 
 function Get-PdfPageCount {
     param([string]$Path)
@@ -77,8 +87,11 @@ if ($Headless) {
         Start-Sleep -Seconds 1
     }
 
-    $exitCode = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $outPath -TargetUrl $url -WaitMs $HeadlessWaitMs -WindowSize "1920,1080"
-    Write-Host "Edge headless print process exited with code $exitCode"
+    Write-Host "Headless wait budget: $HeadlessWaitSec sec ($effectiveHeadlessWaitMs ms)"
+    $printSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $exitCode = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $outPath -TargetUrl $url -WaitMs $effectiveHeadlessWaitMs -WindowSize "1920,1080"
+    $printSw.Stop()
+    Write-Host "Edge headless print process exited with code $exitCode after $([Math]::Round($printSw.Elapsed.TotalSeconds,1))s"
 
     if (-not (Test-Path $outPath)) {
         throw "Headless print did not produce output file: $outPath"
@@ -88,16 +101,41 @@ if ($Headless) {
     $pageCount = Get-PdfPageCount $outPath
     Write-Host "PDF saved to $outPath ($($pdfInfo.Length) bytes, approx pages=$pageCount)"
 
-    # Retry once with longer virtual time budget and taller viewport if first render looks truncated.
-    if ($pageCount -le 1) {
-        $retryWait = [Math]::Max($HeadlessWaitMs * 2, 240000)
-        Write-Host "Detected single-page output; retrying once with longer wait (${retryWait}ms) and taller viewport..."
-        $exitCode2 = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $outPath -TargetUrl $url -WaitMs $retryWait -WindowSize "1920,4000"
-        Write-Host "Retry print process exited with code $exitCode2"
+    # Optional second pass with longer wait and taller viewport to capture lazy/late-loading images.
+    if ($HeadlessSecondPass) {
+        $retryWaitMs = [Math]::Max($effectiveHeadlessWaitMs * 2, 240000)
+        $retryWaitSec = [int][Math]::Ceiling($retryWaitMs / 1000.0)
+        $secondPassPath = [IO.Path]::ChangeExtension($outPath, $null) + ".pass2.pdf"
+        Write-Host "Running second pass for image completeness (${retryWaitSec}s / ${retryWaitMs}ms), taller viewport..."
+        $retrySw = [System.Diagnostics.Stopwatch]::StartNew()
+        $exitCode2 = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $secondPassPath -TargetUrl $url -WaitMs $retryWaitMs -WindowSize "1920,4000"
+        $retrySw.Stop()
+        Write-Host "Retry print process exited with code $exitCode2 after $([Math]::Round($retrySw.Elapsed.TotalSeconds,1))s"
 
-        $pdfInfo = Get-Item $outPath
-        $pageCount = Get-PdfPageCount $outPath
-        Write-Host "PDF after retry: $outPath ($($pdfInfo.Length) bytes, approx pages=$pageCount)"
+        if (Test-Path $secondPassPath) {
+            $firstInfo = Get-Item $outPath
+            $firstPages = Get-PdfPageCount $outPath
+            $secondInfo = Get-Item $secondPassPath
+            $secondPages = Get-PdfPageCount $secondPassPath
+
+            $useSecond = $false
+            if ($secondPages -gt $firstPages) { $useSecond = $true }
+            elseif ($secondPages -eq $firstPages -and $secondInfo.Length -gt $firstInfo.Length) { $useSecond = $true }
+
+            if ($useSecond) {
+                Move-Item -Path $secondPassPath -Destination $outPath -Force
+                $pdfInfo = Get-Item $outPath
+                $pageCount = Get-PdfPageCount $outPath
+                Write-Host "Selected second-pass PDF: $outPath ($($pdfInfo.Length) bytes, approx pages=$pageCount)"
+            } else {
+                Remove-Item -Path $secondPassPath -Force -ErrorAction SilentlyContinue
+                Write-Host "Kept first-pass PDF: $outPath ($($firstInfo.Length) bytes, approx pages=$firstPages)"
+                $pdfInfo = $firstInfo
+                $pageCount = $firstPages
+            }
+        } else {
+            Write-Host "Second pass did not produce an output file; keeping first pass."
+        }
     }
 
     if ($pdfInfo.Length -lt 1024) {
