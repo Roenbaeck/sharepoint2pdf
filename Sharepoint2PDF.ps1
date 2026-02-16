@@ -1,14 +1,13 @@
 ﻿param(
     [switch]$Headless,
-    [string]$HeadlessOutput = "C:\KVM-PDF\output_headless.pdf",
+    [string]$HeadlessOutput = "C:\KVM-PDF",
     [string]$UserDataDir = "",
     [int]$MaxDepth = 1,
     [int]$MinContentChars = 50,
     [int]$HeadlessWaitSec = 120,
     [int]$HeadlessWaitMs = 0,
     [int]$HeadlessViewportWidth = 1200,
-    [double]$HeadlessSecondPassWidthFactor = 0.85,
-    [switch]$HeadlessSecondPass
+    [int]$HeadlessWarmupSec = 0
 )
 
 $url = "https://amfpension.sharepoint.com/sites/DWplattformsteam-STM/SitePages/Kundvärdesmodellen.aspx"
@@ -22,8 +21,32 @@ $edgePath = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 if (-not (Test-Path $edgePath)) { $edgePath = "C:\Program Files\Microsoft\Edge\Application\msedge.exe" }
 $profileDir = if ($UserDataDir -and (Test-Path $UserDataDir)) { $UserDataDir } else { Join-Path $env:TEMP "edge-remote-profile" }
 if (-not (Test-Path $profileDir)) { New-Item -Path $profileDir -ItemType Directory | Out-Null }
-$outPath = $HeadlessOutput
-if (-not (Test-Path (Split-Path $outPath -Parent))) { New-Item -Path (Split-Path $outPath -Parent) -ItemType Directory | Out-Null }
+$outputDir = $HeadlessOutput
+if ([string]::IsNullOrWhiteSpace($outputDir)) { $outputDir = "C:\KVM-PDF" }
+if ([IO.Path]::GetExtension($outputDir) -ieq '.pdf') {
+    Write-Host "HeadlessOutput now expects a directory; using parent directory of provided file path."
+    $outputDir = Split-Path $outputDir -Parent
+}
+if (-not (Test-Path $outputDir)) { New-Item -Path $outputDir -ItemType Directory | Out-Null }
+
+try {
+    $urlObj = [URI]$url
+    $urlLeaf = [IO.Path]::GetFileName($urlObj.AbsolutePath)
+    if (-not [string]::IsNullOrWhiteSpace($urlLeaf)) {
+        $urlLeaf = [URI]::UnescapeDataString($urlLeaf)
+    }
+    if ([string]::IsNullOrWhiteSpace($urlLeaf)) { $urlLeaf = $urlObj.Host }
+} catch {
+    $urlLeaf = "output"
+}
+
+$urlBase = [IO.Path]::GetFileNameWithoutExtension($urlLeaf)
+if ([string]::IsNullOrWhiteSpace($urlBase)) { $urlBase = "output" }
+$invalidFileChars = [IO.Path]::GetInvalidFileNameChars()
+$safeBase = -join ($urlBase.ToCharArray() | ForEach-Object { if ($invalidFileChars -contains $_) { '_' } else { $_ } })
+$safeBase = $safeBase.Trim('.',' ')
+if ([string]::IsNullOrWhiteSpace($safeBase)) { $safeBase = "output" }
+$outPath = Join-Path $outputDir ("{0}.pdf" -f $safeBase)
 
 if ($HeadlessWaitMs -gt 0) {
     Write-Host "HeadlessWaitMs is deprecated; converting ${HeadlessWaitMs}ms to seconds. Use -HeadlessWaitSec instead."
@@ -31,16 +54,11 @@ if ($HeadlessWaitMs -gt 0) {
 }
 if ($HeadlessWaitSec -lt 1) { $HeadlessWaitSec = 1 }
 $effectiveHeadlessWaitMs = $HeadlessWaitSec * 1000
-if (-not $PSBoundParameters.ContainsKey('HeadlessSecondPass')) { $HeadlessSecondPass = $true }
 if ($HeadlessViewportWidth -lt 800) { $HeadlessViewportWidth = 800 }
-if ($HeadlessSecondPassWidthFactor -le 0 -or $HeadlessSecondPassWidthFactor -gt 1) { $HeadlessSecondPassWidthFactor = 0.85 }
+if ($HeadlessWarmupSec -lt 0) { $HeadlessWarmupSec = 0 }
 $a4Ratio = [Math]::Sqrt(2)
 $viewportHeight = [int][Math]::Round($HeadlessViewportWidth * $a4Ratio)
 $headlessWindowSize = "{0},{1}" -f $HeadlessViewportWidth, $viewportHeight
-$secondPassViewportWidth = [int][Math]::Round($HeadlessViewportWidth * $HeadlessSecondPassWidthFactor)
-if ($secondPassViewportWidth -lt 800) { $secondPassViewportWidth = 800 }
-$secondPassViewportHeight = [int][Math]::Round($secondPassViewportWidth * $a4Ratio)
-$secondPassWindowSize = "{0},{1}" -f $secondPassViewportWidth, $secondPassViewportHeight
 
 function Get-PdfPageCount {
     param([string]$Path)
@@ -100,6 +118,18 @@ if ($Headless) {
 
     Write-Host "Headless wait budget: $HeadlessWaitSec sec ($effectiveHeadlessWaitMs ms)"
     Write-Host "Headless viewport (A4 portrait ratio): $headlessWindowSize"
+
+    if ($HeadlessWarmupSec -gt 0) {
+        $warmupMs = $HeadlessWarmupSec * 1000
+        $warmupPath = [IO.Path]::ChangeExtension($outPath, $null) + ".warmup.pdf"
+        Write-Host "Running warm-up pass for $HeadlessWarmupSec sec before first output..."
+        $warmupSw = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $warmupPath -TargetUrl $url -WaitMs $warmupMs -WindowSize $headlessWindowSize
+        $warmupSw.Stop()
+        if (Test-Path $warmupPath) { Remove-Item -Path $warmupPath -Force -ErrorAction SilentlyContinue }
+        Write-Host "Warm-up pass finished after $([Math]::Round($warmupSw.Elapsed.TotalSeconds,1))s"
+    }
+
     $printSw = [System.Diagnostics.Stopwatch]::StartNew()
     $exitCode = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $outPath -TargetUrl $url -WaitMs $effectiveHeadlessWaitMs -WindowSize $headlessWindowSize
     $printSw.Stop()
@@ -112,43 +142,6 @@ if ($Headless) {
     $pdfInfo = Get-Item $outPath
     $pageCount = Get-PdfPageCount $outPath
     Write-Host "PDF saved to $outPath ($($pdfInfo.Length) bytes, approx pages=$pageCount)"
-
-    # Optional second pass with longer wait and taller viewport to capture lazy/late-loading images.
-    if ($HeadlessSecondPass) {
-        $retryWaitMs = [Math]::Max($effectiveHeadlessWaitMs * 2, 240000)
-        $retryWaitSec = [int][Math]::Ceiling($retryWaitMs / 1000.0)
-        $secondPassPath = [IO.Path]::ChangeExtension($outPath, $null) + ".pass2.pdf"
-        Write-Host "Running second pass for image completeness (${retryWaitSec}s / ${retryWaitMs}ms), narrower A4 portrait viewport $secondPassWindowSize..."
-        $retrySw = [System.Diagnostics.Stopwatch]::StartNew()
-        $exitCode2 = Invoke-HeadlessDirectPrint -EdgePath $edgePath -ProfileDir $profileDir -OutputPath $secondPassPath -TargetUrl $url -WaitMs $retryWaitMs -WindowSize $secondPassWindowSize
-        $retrySw.Stop()
-        Write-Host "Retry print process exited with code $exitCode2 after $([Math]::Round($retrySw.Elapsed.TotalSeconds,1))s"
-
-        if (Test-Path $secondPassPath) {
-            $firstInfo = Get-Item $outPath
-            $firstPages = Get-PdfPageCount $outPath
-            $secondInfo = Get-Item $secondPassPath
-            $secondPages = Get-PdfPageCount $secondPassPath
-
-            $useSecond = $false
-            if ($secondPages -gt $firstPages) { $useSecond = $true }
-            elseif ($secondPages -eq $firstPages -and $secondInfo.Length -gt $firstInfo.Length) { $useSecond = $true }
-
-            if ($useSecond) {
-                Move-Item -Path $secondPassPath -Destination $outPath -Force
-                $pdfInfo = Get-Item $outPath
-                $pageCount = Get-PdfPageCount $outPath
-                Write-Host "Selected second-pass PDF: $outPath ($($pdfInfo.Length) bytes, approx pages=$pageCount)"
-            } else {
-                Remove-Item -Path $secondPassPath -Force -ErrorAction SilentlyContinue
-                Write-Host "Kept first-pass PDF: $outPath ($($firstInfo.Length) bytes, approx pages=$firstPages)"
-                $pdfInfo = $firstInfo
-                $pageCount = $firstPages
-            }
-        } else {
-            Write-Host "Second pass did not produce an output file; keeping first pass."
-        }
-    }
 
     if ($pdfInfo.Length -lt 1024) {
         Write-Host "Warning: PDF is very small; this can happen if the page requires an authenticated profile."
